@@ -1,38 +1,54 @@
 #!/usr/bin/env python3
+import argparse
 import asyncio
-import datetime
 import logging
 import struct
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from functools import partial
-from typing import Callable, Optional, Union
+from typing import Awaitable, Callable, Optional, Union
+
+import pytz
+from influxdb import InfluxDBClient  # type: ignore
 
 logger = logging.getLogger(__name__)
 
 
-def _to_datetime(data: bytes) -> datetime.datetime:
-    if len(data) != 6:
-        raise IOError(f"Invalid date: {data.hex()}")
-    ymdhms = list(struct.unpack("!BBBBBB", data))
-    ymdhms[0] += 2000
-    return datetime.datetime(*ymdhms)
+@dataclass
+class ClientTime:
+    tz: pytz.tzinfo.BaseTzInfo
+
+    def to_datetime(self, data: bytes) -> datetime:
+        if len(data) != 6:
+            raise IOError(f"Invalid date: {data.hex()}")
+        ymdhms = list(struct.unpack("!BBBBBB", data))
+        ymdhms[0] += 2000
+        out = datetime(*ymdhms)
+        return self.tz.localize(out)
+
+    def from_datetime(self, value: datetime) -> bytes:
+        clientval = self.tz.normalize(value)
+        return struct.pack(
+            "!BBBBBB",
+            clientval.year - 2000,
+            clientval.month,
+            clientval.day,
+            clientval.hour,
+            clientval.minute,
+            clientval.second,
+        )
+
+    def now(self) -> datetime:
+        return datetime.now(self.tz)
 
 
-def _from_datetime(value: datetime.datetime) -> bytes:
-    return struct.pack(
-        "!BBBBBB",
-        value.year - 2000,
-        value.month,
-        value.day,
-        value.hour,
-        value.minute,
-        value.second,
-    )
+# TODO: learn timezone from client
+CLIENT_TIME = ClientTime(pytz.UTC)
 
 
-def _cksum(data: bytes):
+def _cksum(data: bytes) -> bytes:
     s1, s2 = 0, 222
     for byte in data:
         s1 = (s1 + byte) & 0xFF
@@ -41,9 +57,9 @@ def _cksum(data: bytes):
 
 
 @dataclass
-class Reading:
-    key: str
-    value: Union[datetime.datetime, int]
+class Readings:
+    date: datetime
+    values: dict[str, int]
     _reading = {
         0: "Date",
         1: "PM2.5",
@@ -56,25 +72,25 @@ class Reading:
     _dtype_size = {0: 1, 3: 2, 4: 4, 9: 6}
 
     @classmethod
-    def parse(cls, data: bytes) -> tuple["Reading", bytes]:
-        keyid, flag, dtype = struct.unpack("!BBB", data[:3])
-        if dtype not in cls._dtype_size:
-            raise IOError(f"Bad Reading value dtype {dtype} in {data.hex()}")
-        length = cls._dtype_size[dtype]
-        key = cls._reading.get(keyid, str(keyid))
-        if flag == 0x10:
-            out = Reading(key, _to_datetime(data[3 : 3 + length]))
-        else:
-            out = Reading(key, int(data[3 : 3 + length].hex(), base=16))
-        return out, data[3 + length :]
-
-    @classmethod
-    def parse_all(cls, data: bytes):
-        out = []
+    def parse(cls, data: bytes) -> "Readings":
+        values = {}
+        date = None
         while len(data):
-            reading, data = Reading.parse(data)
-            out.append(reading)
-        return out
+            keyid, flag, dtype = struct.unpack("!BBB", data[:3])
+            if dtype not in cls._dtype_size:
+                raise IOError(f"Bad Reading value dtype {dtype} in {data.hex()}")
+            length = cls._dtype_size[dtype]
+            key = cls._reading.get(keyid, str(keyid))
+            if flag == 0x10:
+                if key != "Date":
+                    raise IOError(f"Unexpected datetime value for {key}")
+                date = CLIENT_TIME.to_datetime(data[3 : 3 + length])
+            else:
+                values[key] = int(data[3 : 3 + length].hex(), base=16)
+            data = data[3 + length :]
+        if date is None:
+            raise IOError("Did not recieve date for reading")
+        return cls(date, values)
 
 
 class MsgType(Enum):
@@ -104,9 +120,7 @@ _AppMessage_const = 0x86090000
 class AppMessage:
     type: MsgType
     flag: int
-    payload: Union[
-        list[Reading], tuple[bytes, datetime.datetime], datetime.datetime, bytes
-    ]
+    payload: Union[Readings, tuple[bytes, datetime], datetime, bytes]
 
     @classmethod
     def deserialize(cls, data: bytes) -> "AppMessage":
@@ -129,13 +143,13 @@ class AppMessage:
             return AppMessage(
                 msgtype,
                 flag,
-                Reading.parse_all(payload),
+                Readings.parse(payload),
             )
         elif msgtype == MsgType.Time and len(payload) == 6:
-            return AppMessage(msgtype, flag, _to_datetime(payload))
+            return AppMessage(msgtype, flag, CLIENT_TIME.to_datetime(payload))
         elif msgtype == MsgType.Time2 and len(payload) == 12:
             stuff = payload[:6]
-            date = _to_datetime(payload[6:])
+            date = CLIENT_TIME.to_datetime(payload[6:])
             return AppMessage(msgtype, flag, (stuff, date))
         else:
             return AppMessage(msgtype, flag, payload)
@@ -144,46 +158,45 @@ class AppMessage:
         if isinstance(self.payload, bytes):
             payload = self.payload
         elif isinstance(self.payload, tuple):
-            payload = self.payload[0] + _from_datetime(self.payload[1])
-        elif isinstance(self.payload, datetime.datetime):
-            payload = _from_datetime(self.payload)
+            payload = self.payload[0] + CLIENT_TIME.from_datetime(self.payload[1])
+        elif isinstance(self.payload, datetime):
+            payload = CLIENT_TIME.from_datetime(self.payload)
         data = struct.pack(
             "!BIHBHH", 0x68, _AppMessage_const, self.type, 0x68, self.flag, len(payload)
         )
         data += payload
         return data
 
+    @property
+    def readings(self) -> Optional[Readings]:
+        if self.type in (MsgType.CurrentValue, MsgType.LoggedValue):
+            assert isinstance(self.payload, Readings)
+            return self.payload
+        return None
+
 
 class ServerState:
-    def __init__(self, commit_fn: Callable[[dict[str, int]], None]):
-        self.commit = commit_fn
+    def __init__(self) -> None:
         self.in_time_seq = False
 
     def respond(self, msg: AppMessage) -> Optional[AppMessage]:
         # TODO msg: Message
         if msg.type == MsgType.Time and not self.in_time_seq:
             self.in_time_seq = True
-            return AppMessage(MsgType.Time, 0, datetime.datetime.now())
+            return AppMessage(MsgType.Time, 0, CLIENT_TIME.now())
         elif msg.type == MsgType.Time and self.in_time_seq:
             self.in_time_seq = False
         elif msg.type == MsgType.Time2:
             return AppMessage(
                 MsgType.Time,
                 0,
-                (bytes.fromhex("0002003c03ac"), datetime.datetime.now()),
+                (bytes.fromhex("0002003c03ac"), CLIENT_TIME.now()),
             )
         elif msg.type == MsgType.Time3:
             return AppMessage(MsgType.Time3, 1, b"\x00")
         elif msg.type == MsgType.CurrentValue:
-            # TODO: async?
-            data = {record.key: record.value for record in msg.payload}
-            data["Type"] = str(msg.type)
-            self.commit(data)
             return AppMessage(MsgType.CurrentValue, 1, b"\x00")
         elif msg.type == MsgType.LoggedValue:
-            data = {record.key: record.value for record in msg.payload}
-            data["Type"] = str(msg.type)
-            self.commit(data)
             return AppMessage(MsgType.LoggedValue, 0, b"\x00")
         return None
 
@@ -194,7 +207,7 @@ class Message:
     payload: AppMessage
 
     @classmethod
-    async def read(cls, reader: asyncio.StreamReader):
+    async def read(cls, reader: asyncio.StreamReader) -> "Message":
         data = await reader.readexactly(14)
         if not (data[0] == 0x55 and data[11] == 0x55):
             raise IOError(f"Message missing magic bytes: {data.hex()}")
@@ -213,7 +226,7 @@ class Message:
             )
         return cls(device_id, AppMessage.deserialize(payload))
 
-    async def write(self, writer):
+    async def write(self, writer: asyncio.StreamWriter) -> None:
         data = b"\x55" + self.device_id + b"\x55"
         payload = self.payload.serialize()
         data += struct.pack("!H", len(payload) + 2)
@@ -224,17 +237,24 @@ class Message:
         await writer.drain()
 
 
-async def handle_client(commit_fn, reader, writer):
+async def handle_client(
+    commit_fn: Callable[[str, Readings], Awaitable[None]],
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+) -> None:
     client_addr = writer.get_extra_info("peername")
     logger.info(f"New connection from {client_addr!r}")
-    state = ServerState(commit_fn)
+    state = ServerState()
     try:
         while True:
             message = await Message.read(reader)
-            logger.debug(f"New message from {client_addr!r}: {message!r} ")
+            logger.debug(f"New message from {client_addr!r}: {message!r}")
+            if data := message.payload.readings:
+                logger.debug(f"Committing data point: {data!r}")
+                await commit_fn(message.payload.type.name, data)
             if reply_payload := state.respond(message.payload):
                 reply = Message(message.device_id, reply_payload)
-                logger.debug(f"Responding with: {reply!r} ")
+                logger.debug(f"Responding with: {reply!r}")
                 await reply.write(writer)
     except asyncio.IncompleteReadError as ex:
         logger.warning(ex)
@@ -246,9 +266,18 @@ async def handle_client(commit_fn, reader, writer):
         writer.close()
 
 
-async def main():
-    def commit(data: dict[str, int]) -> None:
-        print(data)
+async def main(idbclient: InfluxDBClient) -> None:
+    async def commit(msgtype: str, data: Readings) -> None:
+        point = {
+            "measurement": msgtype,
+            "time": data.date.astimezone(pytz.utc),
+            "fields": data.values,
+        }
+        # InfluxDBClient 1.x has no async methods
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: idbclient.write_points([point]),  # type: ignore
+        )
 
     server = await asyncio.start_server(
         partial(handle_client, commit), "54.80.232.65", 5580
@@ -261,6 +290,17 @@ async def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        "Temtop data logging server with InfluxDB forwarding"
+    )
+    parser.add_argument("--tz", help="Timezone", type=str)
+    parser.add_argument("-l", help="Log file", type=str, default="server.log")
+    parser.add_argument("--host", help="InfluxDB hostname", type=str)
+    parser.add_argument("--username", help="InfluxDB username", type=str)
+    parser.add_argument("--password", help="InfluxDB password", type=str)
+    args = parser.parse_args()
+
+    CLIENT_TIME.tz = pytz.timezone(args.tz)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
@@ -270,4 +310,12 @@ if __name__ == "__main__":
             logging.StreamHandler(),  # stderr
         ],
     )
-    asyncio.run(main())
+
+    idbclient = InfluxDBClient(
+        host=args.host,
+        port=8086,
+        username=args.username,
+        password=args.password,
+        database="temtop",
+    )
+    asyncio.run(main(idbclient))
