@@ -306,7 +306,7 @@ if __name__ == "__main__":
         format="%(asctime)s %(levelname)s: %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[
-            logging.FileHandler("server.log"),
+            logging.FileHandler(args.l),
             logging.StreamHandler(),  # stderr
         ],
     )
