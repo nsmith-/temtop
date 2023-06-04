@@ -273,10 +273,17 @@ async def main(idbclient: InfluxDBClient) -> None:
             "time": data.date.astimezone(pytz.utc),
             "fields": data.values,
         }
+
         # InfluxDBClient 1.x has no async methods
+        def write():
+            try:
+                idbclient.write_points([point]),  # type: ignore
+            except Exception as e:
+                logger.warning(f"Failed to commit point: {e}")
+
         await asyncio.get_running_loop().run_in_executor(
             None,
-            lambda: idbclient.write_points([point]),  # type: ignore
+            write,
         )
 
     server = await asyncio.start_server(
